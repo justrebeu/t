@@ -76,6 +76,17 @@ def bump(guild_id: int, key: str) -> None:
     save_config()
 
 
+def get_infractions(guild_id: int, user_id: int) -> int:
+    return config.get(str(guild_id), {}).get("infractions", {}).get(str(user_id), 0)
+
+
+def add_infraction(guild_id: int, user_id: int) -> None:
+    entry = config.setdefault(str(guild_id), {})
+    infractions = entry.setdefault("infractions", {})
+    infractions[str(user_id)] = infractions.get(str(user_id), 0) + 1
+    save_config()
+
+
 # ----------------------------- Utilitaires -----------------------------
 
 counters: dict = defaultdict(list)
@@ -126,6 +137,7 @@ async def get_executor(guild: discord.Guild, action: discord.AuditLogAction, tar
 
 async def punish(guild: discord.Guild, user_id: int, reason: str):
     bump(guild.id, "raid_sanctions")
+    add_infraction(guild.id, user_id)
     try:
         await guild.ban(discord.Object(id=user_id), reason=f"[Protect] {reason}")
         await log(guild, "🔨 Utilisateur banni", f"<@{user_id}>\n**Raison :** {reason}", 0xE74C3C)
@@ -251,6 +263,7 @@ async def on_member_join(member: discord.Member):
         except discord.HTTPException:
             return
         bump(member.guild.id, "blocked_accounts")
+        add_infraction(member.guild.id, member.id)
         await log(
             member.guild,
             "🚫 Compte suspect bloqué",
@@ -326,6 +339,7 @@ async def check_spam(message: discord.Message):
         except discord.HTTPException:
             return
         bump(guild.id, "spam_sanctions")
+        add_infraction(guild.id, message.author.id)
         try:
             await message.channel.send(
                 f"🔇 {message.author.mention} a été mute {conf['timeout_seconds']}s pour spam."
@@ -474,10 +488,158 @@ async def security_status(ctx: commands.Context):
     await ctx.reply(embed=embed)
 
 
+# --------------------- Système de confiance (+co) ---------------------
+
+def trust_report(member: discord.Member) -> dict:
+    """Calcule un score de confiance (0-100) à partir de signaux simples."""
+    guild = member.guild
+    conf = get_conf(guild.id)
+    now = datetime.now(timezone.utc)
+
+    if member.id == guild.owner_id or member.id in conf["whitelist"]:
+        return {"special": True, "score": 100, "details": ["Propriétaire ou utilisateur de confiance"]}
+
+    risk = 0
+    details = []
+
+    age_days = (now - member.created_at).total_seconds() / 86400
+    if age_days < 1:
+        risk += 40
+        details.append(f"🔴 Compte créé il y a moins d'un jour (+40)")
+    elif age_days < conf["min_account_age_days"]:
+        risk += 30
+        details.append(f"🟠 Compte très récent : {age_days:.0f} jour(s) (+30)")
+    elif age_days < 30:
+        risk += 15
+        details.append(f"🟡 Compte récent : {age_days:.0f} jours (+15)")
+    elif age_days < 90:
+        risk += 5
+        details.append(f"🟡 Compte de {age_days:.0f} jours (+5)")
+    else:
+        details.append(f"🟢 Compte ancien : {age_days:.0f} jours (+0)")
+
+    if member.avatar is None:
+        risk += 10
+        details.append("🟡 Pas de photo de profil (+10)")
+
+    if member.joined_at:
+        joined_days = (now - member.joined_at).total_seconds() / 86400
+        if joined_days < 1:
+            risk += 15
+            details.append("🟠 Arrivé sur le serveur il y a moins d'un jour (+15)")
+        elif joined_days < 7:
+            risk += 8
+            details.append(f"🟡 Arrivé il y a {joined_days:.0f} jour(s) (+8)")
+        else:
+            details.append(f"🟢 Membre depuis {joined_days:.0f} jours (+0)")
+
+    infractions = get_infractions(guild.id, member.id)
+    if infractions:
+        pts = min(infractions * 15, 45)
+        risk += pts
+        details.append(f"🔴 {infractions} sanction(s) du bot (+{pts})")
+
+    if member.is_timed_out():
+        risk += 10
+        details.append("🟠 Actuellement en sourdine (+10)")
+
+    score = max(0, 100 - risk)
+    return {"special": False, "score": score, "details": details}
+
+
+def trust_level(score: int):
+    if score >= 80:
+        return "🟢 Normal", 0x2ECC71
+    if score >= 60:
+        return "🟡 À surveiller", 0xF1C40F
+    if score >= 40:
+        return "🟠 Suspect", 0xE67E22
+    return "🔴 Critique", 0xE74C3C
+
+
+@bot.command(name="co")
+@commands.guild_only()
+@commands.has_permissions(manage_messages=True)
+async def co(ctx: commands.Context, member: discord.Member = None):
+    member = member or ctx.author
+    report = trust_report(member)
+    score = report["score"]
+
+    if report["special"]:
+        level, color = "💎 De confiance", 0x9B59B6
+    else:
+        level, color = trust_level(score)
+
+    filled = score // 10
+    bar = "█" * filled + "░" * (10 - filled)
+
+    embed = discord.Embed(title=f"🔎 Confiance : {member}", color=color)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="Niveau", value=level, inline=True)
+    embed.add_field(name="Score", value=f"`{bar}` **{score}/100**", inline=True)
+    embed.add_field(name="Détails", value="\n".join(report["details"]), inline=False)
+    if member.bot:
+        embed.set_footer(text="Ce compte est un bot.")
+    await ctx.reply(embed=embed)
+
+
+# ----------------------------- +slowmode -----------------------------
+
+def parse_duration(text: str) -> int:
+    text = text.strip().lower()
+    if text in ("off", "0", "none", "non", "stop"):
+        return 0
+    units = {"s": 1, "m": 60, "h": 3600}
+    if text[-1] in units:
+        return int(text[:-1]) * units[text[-1]]
+    return int(text)  # sans unité = secondes
+
+
+def format_duration(seconds: int) -> str:
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60}min"
+    return f"{seconds}s"
+
+
+@bot.command(name="slowmode")
+@commands.guild_only()
+@commands.has_permissions(manage_channels=True)
+async def slowmode(ctx: commands.Context, duration: str = None):
+    channel = ctx.channel
+    if duration is None:
+        current = channel.slowmode_delay
+        text = format_duration(current) if current else "désactivé"
+        return await ctx.reply(
+            f"⏱️ Slowmode actuel : **{text}**\nUsage : `+slowmode 5s`, `+slowmode 10m`, `+slowmode 1h`, `+slowmode off`"
+        )
+    try:
+        seconds = parse_duration(duration)
+    except (ValueError, IndexError):
+        return await ctx.reply("❌ Durée invalide. Exemples : `5s`, `10m`, `1h`, `off`.")
+    if seconds < 0 or seconds > 21600:
+        return await ctx.reply("❌ La durée doit être comprise entre 0 et 6h.")
+    try:
+        await channel.edit(slowmode_delay=seconds, reason=f"[Protect] Slowmode par {ctx.author}")
+    except discord.HTTPException:
+        return await ctx.reply("❌ Je n'ai pas la permission de modifier ce salon.")
+    if seconds == 0:
+        await ctx.reply("✅ Slowmode désactivé.")
+    else:
+        await ctx.reply(f"✅ Slowmode réglé sur **{format_duration(seconds)}**.")
+    await log(
+        ctx.guild,
+        "⏱️ Slowmode modifié",
+        f"{ctx.channel.mention} → {format_duration(seconds) if seconds else 'désactivé'} par {ctx.author.mention}",
+    )
+
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.reply("❌ Il faut la permission **Administrateur**.")
+        perms = ", ".join(error.missing_permissions)
+        await ctx.reply(f"❌ Permission manquante : `{perms}`.")
     elif isinstance(error, (commands.CommandNotFound, commands.NoPrivateMessage)):
         return
     elif isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
